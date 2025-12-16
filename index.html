@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>手势切水果 (Three.js + MediaPipe)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #222; font-family: 'Arial', sans-serif; }
+        #game-container { position: absolute; width: 100%; height: 100%; top: 0; left: 0; }
+        
+        /* UI Layer */
+        #ui-layer { position: absolute; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
+        #score-display { position: absolute; top: 20px; left: 20px; color: white; font-size: 32px; font-weight: bold; text-shadow: 2px 2px 4px rgba(0,0,0,0.5); display: none;}
+        #start-screen, #game-over-screen { position: absolute; width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; color: white; background: rgba(0,0,0,0.6); }
+        #game-over-screen { display: none; }
+        h1 { font-size: 48px; margin-bottom: 10px; color: #ffcc00; text-shadow: 0 0 10px red; }
+        p { font-size: 24px; }
+        .blink { animation: blinker 1.5s linear infinite; color: #00ff00; }
+        @keyframes blinker { 50% { opacity: 0; } }
+
+        /* Bottom-Right Camera View */
+        #camera-container {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 240px; /* Fixed width for preview */
+            height: 180px;
+            border: 3px solid #ffcc00;
+            border-radius: 8px;
+            overflow: hidden;
+            z-index: 20;
+            background: #000;
+            transform: scaleX(-1); /* Mirror the preview view */
+        }
+        #input-video { position: absolute; width: 100%; height: 100%; object-fit: cover; opacity: 0.6; }
+        #output-canvas { position: absolute; width: 100%; height: 100%; object-fit: cover; }
+
+        /* Loading indicator */
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #00ff00; font-size: 20px; z-index: 30; }
+    </style>
+</head>
+<body>
+
+    <div id="game-container"></div>
+
+    <div id="ui-layer">
+        <div id="score-display">得分: <span id="score">0</span></div>
+        <div id="start-screen">
+            <h1>手势切水果</h1>
+            <p>请允许摄像头权限</p>
+            <p class="blink">挥动食指切碎“地球”开始游戏！</p>
+            <p style="font-size: 16px; margin-top: 20px;">玩法: 食指控制刀光，切西瓜/便便得分，切炸弹结束。</p>
+        </div>
+        <div id="game-over-screen">
+            <h1>游戏结束!</h1>
+            <p>最终得分: <span id="final-score">0</span></p>
+            <p class="blink" style="margin-top:30px;">切碎“地球”重新开始</p>
+        </div>
+    </div>
+
+    <div id="loading">正在加载 AI 模型和摄像头...</div>
+
+    <div id="camera-container">
+        <video id="input-video" playsinline webkit-playsinline></video>
+        <canvas id="output-canvas"></canvas>
+    </div>
+
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <script>
+        // ================= START: Simple Web Audio API Synth =================
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        
+        function playSound(type) {
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            const osc = audioCtx.createOscillator();
+            const gainNode = audioCtx.createGain();
+            osc.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+
+            const now = audioCtx.currentTime;
+            if (type === 'slice') {
+                // High pitch short chirp
+                osc.type = 'sawtooth';
+                osc.frequency.setValueAtTime(1200, now);
+                osc.frequency.exponentialRampToValueAtTime(400, now + 0.1);
+                gainNode.gain.setValueAtTime(0.5, now);
+                gainNode.gain.exponentialRampToValueAtTime(0.01, now + 0.1);
+                osc.start(now); osc.stop(now + 0.1);
+            } else if (type === 'boom') {
+                // Low pitch explosion noise approximation
+                osc.type = 'square';
+                osc.frequency.setValueAtTime(150, now);
+                osc.frequency.exponentialRampToValueAtTime(20, now + 0.5);
+                gainNode.gain.setValueAtTime(1, now);
+                gainNode.gain.exponentialRampToValueAtTime(0.01, now + 0.5);
+                osc.start(now); osc.stop(now + 0.5);
+            } else if (type === 'start') {
+                 // Pleasant chime
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(660, now);
+                gainNode.gain.setValueAtTime(0.5, now);
+                gainNode.gain.linearRampToValueAtTime(0.01, now + 1.0);
+                osc.start(now); osc.stop(now + 1.0);
+                // Second tone
+                const osc2 = audioCtx.createOscillator();
+                const gain2 = audioCtx.createGain();
+                osc2.connect(gain2); gain2.connect(audioCtx.destination);
+                osc2.type = 'sine'; osc2.frequency.setValueAtTime(880, now + 0.1);
+                gain2.gain.setValueAtTime(0.5, now + 0.1);
+                gain2.gain.linearRampToValueAtTime(0.01, now + 1.1);
+                osc2.start(now + 0.1); osc2.stop(now + 1.1);
+            }
+        }
+        // ================= END: Web Audio API =================
+
+
+        // ================= START: Game State & Variables =================
+        let gameState = 'loading'; // loading, start, playing, gameover
+        let score = 0;
+        const scoreElement = document.getElementById('score');
+        const finalScoreElement = document.getElementById('final-score');
+        const startScreen = document.getElementById('start-screen');
+        const gameOverScreen = document.getElementById('game-over-screen');
+        const scoreDisplay = document.getElementById('score-display');
+        const loadingIndicator = document.getElementById('loading');
+
+        // Three.js Globals
+        let scene, camera, renderer;
+        let bladeLine, bladeGeometry;
+        const bladePositions = []; // History of index finger tip positions
+        const MAX_BLADE_POINTS = 15; // Length of the trail
+
+        let targets = []; // Array to hold active fruit/bombs
+        let earthTarget; // The start game button
+        const Z_PLANE = -15; // The depth where targets spawn
+        let lastSpawnTime = 0;
+
+        // MediaPipe Globals
+        const videoElement = document.getElementById('input-video');
+        const canvasElement = document.getElementById('output-canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        let indexFingerTip3D = new THREE.Vector3(0, 0, 1000); // Current 3D pos of Index Finger tip
+        let isHandDetected = false;
+
+        // Helpers
+        function emojiToTexture(emoji) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 128; canvas.height = 128;
+            const ctx = canvas.getContext('2d');
+            ctx.font = '90px serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(emoji, 64, 64);
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.needsUpdate = true;
+            return texture;
+        }
+        const textures = {
+            melon: emojiToTexture('🍉'),
+            poop: emojiToTexture('💩'),
+            bomb: emojiToTexture('💣')
+        };
+        // ================= END: Game State =================
+
+
+        // ================= START: Three.js Setup =================
+        function initThreeJS() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 10; // Move camera back
+
+            renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setClearColor(0x000000, 0); // Transparent background
+            document.getElementById('game-container').appendChild(renderer.domElement);
+
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(5, 10, 7.5);
+            scene.add(directionalLight);
+
+            // Blade Trail Setup
+            bladeGeometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(MAX_BLADE_POINTS * 3); // 3 vertices per point
+            bladeGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            // Initialize positions off-screen
+            for (let i = 0; i < MAX_BLADE_POINTS; i++) {
+                bladePositions.push(new THREE.Vector3(1000, 1000, 1000));
+            }
+            const bladeMaterial = new THREE.LineBasicMaterial({ color: 0x00ff00, linewidth: 5, opacity: 0.8, transparent: true });
+            bladeLine = new THREE.Line(bladeGeometry, bladeMaterial);
+            scene.add(bladeLine);
+
+            // Start "Earth" Target
+            const earthGeo = new THREE.SphereGeometry(2, 16, 16);
+            const earthMat = new THREE.MeshBasicMaterial({ color: 0x44aa88, wireframe: true });
+            earthTarget = new THREE.Mesh(earthGeo, earthMat);
+            earthTarget.position.set(0, 0, Z_PLANE);
+            earthTarget.userData = { type: 'start' };
+            scene.add(earthTarget);
+
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+        // ================= END: Three.js Setup =================
+
+
+        // ================= START: MediaPipe Setup =================
+        function onResults(results) {
+            if (loadingIndicator.style.display !== 'none') {
+                loadingIndicator.style.display = 'none';
+                gameState = 'start';
+            }
+
+            // 1. Draw on Bottom-Right Canvas
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+            
+            isHandDetected = false;
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                isHandDetected = true;
+                const landmarks = results.multiHandLandmarks[0]; // Use the first detected hand
+
+                // Draw skeleton connection
+                drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+                drawLandmarks(canvasCtx, landmarks, {color: '#FF0000', lineWidth: 1, radius: 2});
+
+                // 2. Map Index Finger Tip (Landmark 8) to 3D World Space
+                // MediaPipe returns normalized [0.0, 1.0] coordinates. 
+                // x: 0(left) -> 1(right), y: 0(top) -> 1(bottom).
+                // Need to flip X because camera input is usually mirrored.
+                const ndcX = (1 - landmarks[8].x) * 2 - 1; // Normalized Device Coordinates [-1, 1]
+                const ndcY = (1 - landmarks[8].y) * 2 - 1; // y is inverted in 3D space vs screen space
+                
+                // Project 2D NDC onto a 3D plane defined by Z_PLANE
+                const vector = new THREE.Vector3(ndcX, ndcY, 0.5);
+                vector.unproject(camera);
+                const dir = vector.sub(camera.position).normalize();
+                const distance = (Z_PLANE - camera.position.z) / dir.z;
+                indexFingerTip3D.copy(camera.position).add(dir.multiplyScalar(distance));
+
+            } else {
+                 // Move blade offscreen if no hand
+                 indexFingerTip3D.set(1000, 1000, 1000);
+            }
+            canvasCtx.restore();
+        }
+
+        function initMediaPipe() {
+            const hands = new Hands({locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }});
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
+            hands.onResults(onResults);
+
+            const cameraMP = new Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({image: videoElement});
+                },
+                width: 320, // Use lower resolution for performance
+                height: 240,
+                facingMode: 'user'
+            });
+            cameraMP.start();
+        }
+        // ================= END: MediaPipe Setup =================
+
+
+        // ================= START: Game Logic =================
+        function startGame() {
+            gameState = 'playing';
+            score = 0;
+            scoreElement.innerText = score;
+            startScreen.style.display = 'none';
+            gameOverScreen.style.display = 'none';
+            scoreDisplay.style.display = 'block';
+            earthTarget.visible = false;
+            playSound('start');
+        }
+
+        function endGame() {
+            gameState = 'gameover';
+            finalScoreElement.innerText = score;
+            scoreDisplay.style.display = 'none';
+            gameOverScreen.style.display = 'flex';
+            earthTarget.visible = true;
+            earthTarget.scale.set(1,1,1); // Reset Scale
+            // Clear targets
+            targets.forEach(t => scene.remove(t.mesh));
+            targets = [];
+            playSound('boom');
+        }
+
+        function spawnTarget() {
+            if (gameState !== 'playing') return;
+            
+            let type, texture, points;
+            const rand = Math.random();
+            if (rand < 0.15) { type = 'bomb'; texture = textures.bomb; points = 0; }
+            else if (rand < 0.6) { type = 'melon'; texture = textures.melon; points = 10; }
+            else { type = 'poop'; texture = textures.poop; points = 5; }
+
+            const geometry = new THREE.BoxGeometry(2, 2, 0.2); // Flat box
+            const material = new THREE.MeshBasicMaterial({ map: texture, transparent: true });
+            const mesh = new THREE.Mesh(geometry, material);
+
+            // Random spawn position at the bottom
+            const xPos = (Math.random() * 20 - 10);
+            mesh.position.set(xPos, -15, Z_PLANE);
+
+            // Physics properties
+            const velocity = new THREE.Vector3(
+                (Math.random() - 0.5) * 0.2, // Random X drift
+                Math.random() * 0.3 + 0.4,  // Upward velocity
+                0
+            );
+            const rotVelocity = new THREE.Vector3(Math.random()*0.1, Math.random()*0.1, Math.random()*0.1);
+
+            scene.add(mesh);
+            targets.push({ mesh, velocity, rotVelocity, type, points, active: true });
+        }
+
+        function updateTargets(deltaTime) {
+             for (let i = targets.length - 1; i >= 0; i--) {
+                const target = targets[i];
+                if (!target.active) continue;
+
+                // Apply Gravity
+                target.velocity.y -= 0.01 * deltaTime;
+                target.mesh.position.add(target.velocity.clone().multiplyScalar(deltaTime));
+                target.mesh.rotation.x += target.rotVelocity.x * deltaTime;
+                target.mesh.rotation.y += target.rotVelocity.y * deltaTime;
+
+                // Remove if fallen off screen
+                if (target.mesh.position.y < -20) {
+                    scene.remove(target.mesh);
+                    targets.splice(i, 1);
+                }
+            }
+        }
+
+        function checkCollision(targetMesh) {
+            if (!isHandDetected) return false;
+            // Simple distance check between finger tip and target center
+            // Threshold needs tuning based on target size
+            const distance = indexFingerTip3D.distanceTo(targetMesh.position);
+            return distance < 2.0; // Collision threshold
+        }
+
+        function handleSlice(targetData, index) {
+            targetData.active = false;
+            scene.remove(targetData.mesh);
+            targets.splice(index, 1);
+
+            if (targetData.type === 'bomb') {
+                endGame();
+            } else {
+                score += targetData.points;
+                scoreElement.innerText = score;
+                playSound('slice');
+                // TODO: Add slice particle effect here if desired
+            }
+        }
+
+        // ================= END: Game Logic =================
+
+
+        // ================= START: Main Loop =================
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const deltaTime = clock.getDelta() * 60; // Normalize to ~60fps bases
+
+            // 1. Update Blade Trail
+            // Shift history positions
+            for (let i = MAX_BLADE_POINTS - 1; i > 0; i--) {
+                bladePositions[i].copy(bladePositions[i - 1]);
+            }
+            // Update tip position
+            bladePositions[0].copy(indexFingerTip3D);
+            // Update geometry attributes
+            const positions = bladeGeometry.attributes.position.array;
+            for (let i = 0; i < MAX_BLADE_POINTS; i++) {
+                positions[i * 3] = bladePositions[i].x;
+                positions[i * 3 + 1] = bladePositions[i].y;
+                positions[i * 3 + 2] = bladePositions[i].z;
+            }
+            bladeGeometry.attributes.position.needsUpdate = true;
+
+
+            // 2. Game State Logic
+            if (gameState === 'start' || gameState === 'gameover') {
+                // Rotate Earth
+                earthTarget.rotation.y += 0.01 * deltaTime;
+                earthTarget.rotation.x += 0.005 * deltaTime;
+                // Check collision to start
+                if (earthTarget.visible && checkCollision(earthTarget)) {
+                    startGame();
+                }
+            } else if (gameState === 'playing') {
+                // Spawn targets progressively faster
+                const now = clock.elapsedTime;
+                const spawnRate = Math.max(0.8, 2.0 - (score / 100)); // Difficulty scaling
+                if (now - lastSpawnTime > spawnRate) {
+                    spawnTarget();
+                    lastSpawnTime = now;
+                }
+
+                // Update and Check collisions for targets
+                updateTargets(deltaTime);
+                for (let i = targets.length - 1; i >= 0; i--) {
+                    if (targets[i].active && checkCollision(targets[i].mesh)) {
+                        handleSlice(targets[i], i);
+                    }
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+        // ================= END: Main Loop =================
+
+
+        // Init
+        initThreeJS();
+        initMediaPipe();
+        // Ensure canvas matches video size once loaded
+        videoElement.onloadedmetadata = () => {
+            canvasElement.width = videoElement.videoWidth;
+            canvasElement.height = videoElement.videoHeight;
+        };
+        animate();
+
+    </script>
+</body>
+</html>
+
